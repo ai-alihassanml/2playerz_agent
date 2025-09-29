@@ -39,9 +39,13 @@ HUGGINGFACEHUB_API_TOKEN = os.getenv("HAGGINGFACEHUB_API_TOKEN")
 if not HUGGINGFACEHUB_API_TOKEN:
     raise ValueError("HAGGINGFACEHUB_API_TOKEN not found in environment variables.")
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-if not OPENROUTER_API_KEY:
-    raise ValueError("OPENROUTER_API_KEY not found in environment variables.")
+# OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+# if not OPENROUTER_API_KEY:
+#     raise ValueError("OPENROUTER_API_KEY not found in environment variables.")
+
+OPENAI_API_KEY= os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY not found in environment variables.")
 
 # initialize models / vector DB (adjust model names / keys as needed)
 try:
@@ -50,9 +54,8 @@ try:
         model="sentence-transformers/all-MiniLM-L6-v2"
     )
     llm = ChatOpenAI(
-        model="x-ai/grok-4-fast:free",
-        api_key=OPENROUTER_API_KEY,
-        base_url="https://openrouter.ai/api/v1"
+        model="gpt-3.5-turbo",
+        openai_api_key=OPENAI_API_KEY,
     )
 
     db = FAISS.load_local("faiss_index2", embeddings, allow_dangerous_deserialization=True)

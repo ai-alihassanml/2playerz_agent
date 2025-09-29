@@ -54,7 +54,7 @@ try:
         model="sentence-transformers/all-MiniLM-L6-v2"
     )
     llm = ChatOpenAI(
-        model="gpt-3.5-turbo",
+        model="gpt-4",
         openai_api_key=OPENAI_API_KEY,
     )
 
@@ -77,20 +77,13 @@ def llm_input_guardrails(input_text: str) -> str:
 
     STRICT RULES - ONLY allow these:
     1. Gaming-related content (games, gaming companies, esports, gaming news, reviews, guides)
-    2. Simple greetings ("hi", "hello", "good morning", "hey")
+    2. Simple greetings ("hi", "hello", "good morning", "hey" , what is my name? etc)
     3. Questions about the AI assistant itself ("what is your name?", "who are you?")
     4. Basic small talk that is gaming-related or neutral
-    5. Allow some neutral, non-gaming small talk (e.g., "how are you?", "what's your favorite color?", "My neme is [name]")
-    6 .understand the user query and i want that also ans if it is some basic chat that do any chatbot
+    5 .i want that understand the user question and if a simple chatbot can answer it then allow it
 
     BLOCK everything else including:
-    - Cooking, recipes, food
-    - Weather, travel, politics
-    - Science, math, programming (unless gaming-related)
-    - Personal life, relationships, health
-    - Business, finance, work
-    - books, music (unless gaming-related)
-    - Any other non-gaming topics
+    - Not Allowed topics: politics, religion, adult content, violence, hate speech, illegal activities, personal data requests
 
     If the input is ALLOWED → output EXACTLY the same input.
     If the input should be BLOCKED → output EXACTLY: "{GUARDRAIL_SENTINEL}".
@@ -283,16 +276,27 @@ def route_query(state: AgentState):
     else:
         return Command(goto="generate_answer_without_docs", update={"router_decision": "llm"})
 
-def generate_answer_without_docs(state: AgentState):
+async def generate_answer_without_docs(state: AgentState):
     print("---NODE: GENERATING ANSWER (NO RETRIEVAL)---")
     messages = state['messages']
     history_str = "\n".join(f"{msg.type.capitalize()}: {msg.content}" for msg in messages)
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "you are a helpful assistant for 2playz website. Ans the user in full human-like sentences. Answer in English and use history to answer."),
+        ("system", "you are a helpful 2playz assistant for 2playz website . this is game nes and blog related websit Answer in English and use history to answer."),
         ("human", "{history}"),
     ])
-    llm_chain = (prompt | llm | StrOutputParser())
-    answer = llm_chain.invoke({"history": history_str})
+    
+    # Stream the response
+    formatted_messages = prompt.format_messages(history=history_str)
+    stream = llm.astream(formatted_messages)
+    answer = ""
+    
+    print("Assistant: ", end="", flush=True)
+    async for chunk in stream:
+        if hasattr(chunk, 'content') and chunk.content:
+            print(chunk.content, end="", flush=True)
+            answer += chunk.content
+    
+    print()  # New line after streaming
     return {"messages": [AIMessage(content=answer)]}
 
 def retrieve_documents(state: AgentState):
@@ -301,16 +305,16 @@ def retrieve_documents(state: AgentState):
     retrieved_docs = retriever.invoke(query)
     return {"retrieved_docs": retrieved_docs}
 
-def generate_answer(state: AgentState):
+async def generate_answer(state: AgentState):
     print("---NODE: GENERATING ANSWER---")
     query = state['query']
     retrieved_docs = state['retrieved_docs']
     template = """
-    You are an AI assistant for 2playz website. Answer in English.
-    Use the following context to answer the question.
-    If the answer is not in the context, say you don't know.
-    Give a detailed, well-structured answer based on the context.
-    Understand the question fully and answer it in detail.
+    Genrate a detail and well-structured answer based on the context and your own knowledge about gaming.
+    You are an AI 2playz assistant. Answer in English.
+    Use the context below to help, but if the context does not fully answer,
+    use your own knowledge about gaming to give a helpful and correct response.
+    Always provide at least one useful answer.
 
     Context:
     {context}
@@ -324,14 +328,27 @@ def generate_answer(state: AgentState):
         f"Title: {doc.metadata.get('title','N/A')}\nSlug: {doc.metadata.get('slug','N/A')}\nContent: {doc.page_content}"
         for doc in retrieved_docs
     )
-    qa_chain = (prompt | llm | StrOutputParser())
-    answer = qa_chain.invoke({"context": context_str, "question": query})
+    
+    # Stream the response
+    formatted_messages = prompt.format_messages(context=context_str, question=query)
+    stream = llm.astream(formatted_messages)
+    answer = ""
+    
+    print("Assistant: ", end="", flush=True)
+    async for chunk in stream:
+        if hasattr(chunk, 'content') and chunk.content:
+            print(chunk.content, end="", flush=True)
+            answer += chunk.content
+    
+    print()  # New line after streaming
     return {"messages": [AIMessage(content=answer)], "retrieved_docs": retrieved_docs}
 
-# --- 4. Build and Compile the Graph ---
+
 memory = MemorySaver()
 
 workflow = StateGraph(AgentState, checkpointers=memory)
+
+
 workflow.add_node("route_query", route_query)
 workflow.add_node("retrieve_documents", retrieve_documents)
 workflow.add_node("generate_answer", generate_answer)
@@ -419,21 +436,28 @@ async def main():
         }
 
         try:
-            final_state = graph.invoke(initial_state, config=config)
+            final_state = await graph.ainvoke(initial_state, config=config)
             english_answer = final_state["messages"][-1].content
 
-            # 6) Translate back to user language (if needed)
-            if detected_lang and detected_lang != "en":
+            # 6) Translate back to user language (if needed) - only if response wasn't already streamed
+            if detected_lang and detected_lang != "en" and not english_answer:
                 try:
                     final_response = await translate_text_async(english_answer, src="en", dest=detected_lang)
+                    print("\n--- Agent's Final Response (Translated) ---")
+                    print(f"Assistant: {final_response}")
                 except Exception as e:
                     print(f"Translation back to user language failed: {e}")
-                    final_response = english_answer
-            else:
-                final_response = english_answer
-
-            print("\n--- Agent's Final Response ---")
-            print(f"Assistant: {final_response}")
+                    print(f"Assistant: {english_answer}")
+            elif detected_lang and detected_lang != "en" and english_answer:
+                # Stream the translation back to user language
+                try:
+                    print("\n--- Translating response back to your language ---")
+                    print("Assistant: ", end="", flush=True)
+                    translated_response = await translate_text_async(english_answer, src="en", dest=detected_lang)
+                    print(translated_response)
+                except Exception as e:
+                    print(f"Translation back to user language failed: {e}")
+                    print(f"Assistant: {english_answer}")
 
             # Print retrieved documents (sources)
             if final_state.get("retrieved_docs"):

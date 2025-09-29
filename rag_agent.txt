@@ -1,0 +1,314 @@
+import os
+import uuid
+import asyncio
+
+from typing_extensions import TypedDict, Annotated
+import operator
+from dotenv import load_dotenv
+from typing import TypedDict, Annotated, List
+
+from langgraph.graph import StateGraph, END, START
+from langchain_community.vectorstores import FAISS 
+# choose your LLM integration - left as ChatOpenAI (you used openrouter/grok previously)
+from langchain_openai import ChatOpenAI
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
+
+from langchain_core.documents import Document 
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langgraph.types import Command
+
+from langdetect import detect
+from googletrans import Translator  # synchronous usage
+
+from langgraph.checkpoint.memory import MemorySaver # type: ignore
+from pymongo import MongoClient
+
+load_dotenv()
+
+# --- 1. Agent State Definition ---
+class AgentState(TypedDict):
+    messages: Annotated[list[BaseMessage], operator.add]
+    retrieved_docs: List[Document]
+    query: str
+
+# --- 2. Environment Setup & Component Loading ---
+HUGGINGFACEHUB_API_TOKEN = os.getenv("HAGGINGFACEHUB_API_TOKEN")
+if not HUGGINGFACEHUB_API_TOKEN:
+    raise ValueError("HAGGINGFACEHUB_API_TOKEN not found in environment variables.")
+
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+if not OPENROUTER_API_KEY:
+    raise ValueError("OPENROUTER_API_KEY not found in environment variables.")
+
+# initialize models / vector DB (adjust model names / keys as needed)
+try:
+    embeddings = HuggingFaceEndpointEmbeddings(
+        huggingfacehub_api_token=HUGGINGFACEHUB_API_TOKEN,
+        model="sentence-transformers/all-MiniLM-L6-v2"
+    )
+    llm = ChatOpenAI(
+        model="x-ai/grok-4-fast:free",
+        api_key=OPENROUTER_API_KEY,
+        base_url="https://openrouter.ai/api/v1"
+    )
+
+    db = FAISS.load_local("faiss_index2", embeddings, allow_dangerous_deserialization=True)
+    retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+except Exception as e:
+    print(f"Error loading models or FAISS index: {e}")
+    raise SystemExit(1)
+
+GUARDRAIL_SENTINEL = "I am not able to assist with that topic. I am designed to help with 2playz.de related questions only."
+
+GUARDRAIL_SENTINEL = "[[FILTERED]]"
+
+def llm_input_guardrails(input_text: str) -> str:
+    print("--- Running humanized input guardrail moderation ---")
+    
+    prompt = ChatPromptTemplate.from_template("""
+    You are a friendly gaming assistant (2playz.de) with built-in guardrails.  
+    Your job is to keep the chat safe, fun, and natural.  
+
+    Personality:  
+    - Casual, friendly, gamer vibe 🎮🔥  
+    - Encourage fun and safe conversation  
+    - Avoid sounding robotic or overly strict  
+
+    Rules:  
+    1. Greetings & Small Talk:  
+       - If user greets ("hi", "hello", "good morning", "my name is ...") → reply warmly.  
+       Examples: "Hey 👋 How’s it going?", "Yo! Ready to talk games?",  
+       "Nice to meet you, {{name}}! What games are you into?"  
+
+    2. Relevant Content (gaming, esports, reviews, updates, community chat):  
+       - Return the input unchanged so the assistant answers normally.  
+
+    3. General Safe Content (science, programming, daily life, random questions):  
+       - Answer normally, but keep a warm tone.  
+       - Example: "That’s not gaming, but I’ll help out anyway 👍"  
+
+    4. Irrelevant Repeated/Off-topic Content:  
+       - Politely redirect:  
+         "That’s not really my main thing 😅 I’m here mostly for gaming and esports. Want me to pull us back into that?"  
+
+    5. Harmful/Unsafe Content (hate, violence, NSFW, illegal):  
+       - Never refuse harshly. Instead:  
+         - Say it seems unsafe 🚫  
+         - Offer a safe alternative.  
+         Example: "I can’t go into that because it’s unsafe,  
+         but I can explain how to protect your accounts or keep things safe online 👍."  
+         - Provide a safe, modified version if possible.  
+
+    6. If the input completely doesn’t fit → reply with EXACTLY: "{GUARDRAIL_SENTINEL}".  
+
+    Input: {input_text}  
+
+    Your Response:
+    """)
+    
+    moderation_chain = (
+        prompt
+        | llm
+        | StrOutputParser()
+    )
+
+    return moderation_chain.invoke({
+        "input_text": input_text,
+        "GUARDRAIL_SENTINEL": GUARDRAIL_SENTINEL
+    })
+
+
+
+
+# Translate user query to English (if needed)
+async def detect_and_translate_to_english(text: str, user_lang: str) -> str:
+    if user_lang == "en":
+        return text  # no translation needed
+    try:
+        async with Translator() as translator:
+            result = await translator.translate(text, src=user_lang, dest="en")
+            return result.text
+    except Exception as e:
+        print(f"Translation error (to English): {e}")
+        return text
+
+# Translate LLM response back to user language
+async def translate_back_to_user_lang(text: str, user_lang: str) -> str:
+    if user_lang == "en":
+        return text  # no translation needed
+    try:
+        async with Translator() as translator:
+            result = await translator.translate(text, src="en", dest=user_lang)
+            return result.text
+    except Exception as e:
+        print(f"Back-translation error: {e}")
+        return text
+
+# --- Graph nodes ---
+def route_query(state: AgentState):
+    print("---NODE: ROUTING QUERY---")
+    query = state['query']
+    prompt = ChatPromptTemplate.from_template("""
+    You are a routing agent. Decide whether a user query should be answered 
+    directly by the LLM ("llm") or by retrieving from the RAG knowledge base ("rag").
+
+    Rules:
+    - Use "llm" for:
+      - Greetings, small talk, casual conversation.
+      - Generic questions not related to games, gaming news, or blog articles.
+      - Questions about yourself (the AI), like "what is your name?"
+
+    - Use "rag" for:
+      - Questions about video games, gaming industry, reviews, guides, updates, or blogs.
+      - Any query that likely requires knowledge from the website 2playerz.de.
+      - Detailed or factual questions about gaming content.
+
+    Respond with only one word: "llm" or "rag".
+
+    Question: {question}
+    """)
+    router_chain = (prompt | llm | StrOutputParser())
+    decision = router_chain.invoke({"question": query}).strip().lower()
+    print(f"---Router Decision: {decision}---")
+    if "rag" in decision:
+        return Command(goto="retrieve_documents", update={"router_decision": "rag"})
+    else:
+        return Command(goto="generate_answer_without_docs", update={"router_decision": "llm"})
+
+def generate_answer_without_docs(state: AgentState):
+    print("---NODE: GENERATING ANSWER (NO RETRIEVAL)---")
+    messages = state['messages']
+    history_str = "\n".join(f"{msg.type.capitalize()}: {msg.content}" for msg in messages)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "you are a helpful assistant for 2playz website. Ans the user in full human-like sentences. Answer in English and use history to answer."),
+        ("human", "{history}"),
+    ])
+    llm_chain = (prompt | llm | StrOutputParser())
+    answer = llm_chain.invoke({"history": history_str})
+    return {"messages": [AIMessage(content=answer)]}
+
+def retrieve_documents(state: AgentState):
+    print("---NODE: RETRIEVING DOCUMENTS---")
+    query = state['query']
+    retrieved_docs = retriever.invoke(query)
+    return {"retrieved_docs": retrieved_docs}
+
+def generate_answer(state: AgentState):
+    print("---NODE: GENERATING ANSWER---")
+    query = state['query']
+    retrieved_docs = state['retrieved_docs']
+    template = """
+    You are an AI assistant for 2playz website. Answer in English.
+    Use the following context to answer the question.
+    If the answer is not in the context, say you don't know.
+    Give a detailed, well-structured answer based on the context.
+    Understand the question fully and answer it in detail.
+
+    Context:
+    {context}
+    
+    Question: {question}
+    
+    Answer:
+    """
+    prompt = ChatPromptTemplate.from_template(template)
+    context_str = "\n\n".join(
+        f"Title: {doc.metadata.get('title','N/A')}\nSlug: {doc.metadata.get('slug','N/A')}\nContent: {doc.page_content}"
+        for doc in retrieved_docs
+    )
+    qa_chain = (prompt | llm | StrOutputParser())
+    answer = qa_chain.invoke({"context": context_str, "question": query})
+    return {"messages": [AIMessage(content=answer)], "retrieved_docs": retrieved_docs}
+
+# --- 4. Build and Compile the Graph ---
+memory = MemorySaver()
+
+workflow = StateGraph(AgentState, checkpointers=memory)
+workflow.add_node("route_query", route_query)
+workflow.add_node("retrieve_documents", retrieve_documents)
+workflow.add_node("generate_answer", generate_answer)
+workflow.add_node("generate_answer_without_docs", generate_answer_without_docs)
+
+workflow.add_edge(START, "route_query")
+workflow.add_edge("retrieve_documents", "generate_answer")
+workflow.add_edge("generate_answer", END)
+workflow.add_edge("generate_answer_without_docs", END)
+
+graph = workflow.compile(checkpointer=memory)
+
+print("\n--- RAG Agent initialized. ---")
+thread_uuid = uuid.uuid1()
+print(f"Thread UUID: {thread_uuid}")
+
+# --- 5. Main Execution Loop with one-time language selection ---
+USER_LANG = None  # "en" or "de"
+
+if __name__ == "__main__":
+    # Ask once for language preference
+    while USER_LANG not in ("en", "de"):
+        USER_LANG = input("Please choose your language (en for English, de for German): ").strip().lower()
+        if USER_LANG not in ("en", "de"):
+            print("Invalid choice. Please enter 'en' or 'de'.")
+
+    print(f"[info] Language preference set to: {USER_LANG}")
+
+    while True:
+        thread_id = str(thread_uuid)
+        config = {"configurable": {"thread_id": thread_id}}
+        user_query = input("\n\nEnter your question (or 'exit' to quit): ").strip()
+        if user_query.lower() == "exit":
+            print("Exiting.")
+            break
+        if not user_query:
+            continue
+
+        # 1) If user selected German, translate to English for processing
+        english_query = asyncio.run(detect_and_translate_to_english(user_query, USER_LANG))
+
+        # 2) Sanitize / moderate via guardrail (runs on English)
+        try:
+            sanitized = llm_input_guardrails(english_query)
+        except Exception as e:
+            print(f"Moderation/guardrail check failed: {e}")
+            sanitized = english_query
+
+        # 3) If guardrail sentinel returned, translate sentinel into user language and print
+        if isinstance(sanitized, str) and sanitized.strip() == GUARDRAIL_SENTINEL:
+            translated_guardrail = asyncio.run(translate_back_to_user_lang(GUARDRAIL_SENTINEL, USER_LANG))
+            print(f"\nAssistant: {translated_guardrail}")
+            continue
+
+        # 4) Build initial state (English)
+        initial_state = {
+            "messages": [HumanMessage(content=sanitized)],
+            "query": sanitized,
+            "retrieved_docs": []
+        }
+
+        try:
+            final_state = graph.invoke(initial_state, config=config)
+
+            # English answer from the agent
+            english_answer = final_state["messages"][-1].content
+
+            # 5) Translate back to German if needed
+            final_response = asyncio.run(translate_back_to_user_lang(english_answer, USER_LANG))
+
+            print("\n--- Agent's Final Response ---")
+            print(f"Assistant: {final_response}")
+
+            # Print retrieved documents (sources)
+            if final_state.get("retrieved_docs"):
+                print("\n--- Retrieved Documents (sources) ---")
+                for doc in final_state["retrieved_docs"]:
+                    slug = doc.metadata.get("slug", "N/A")
+                    title = doc.metadata.get("title", "N/A")
+                    print(f"Title: {title}\nSlug: {slug}\nExcerpt: {doc.page_content[:150]}...\n")
+            else:
+                print("\n--- Retrieved Documents (sources) ---\nNone")
+
+        except Exception as e:
+            print(f"An error occurred during agent execution: {e}")
+

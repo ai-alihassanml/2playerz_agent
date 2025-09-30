@@ -59,12 +59,12 @@ try:
     )
 
     db = FAISS.load_local("faiss_index2", embeddings, allow_dangerous_deserialization=True)
-    retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+    retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 2})
 except Exception as e:
     print(f"Error loading models or FAISS index: {e}")
     raise SystemExit(1)
 
-GUARDRAIL_SENTINEL = "I am not able to assist with that topic. I am designed to help with 2playz.de related questions only."
+GUARDRAIL_SENTINEL = "I am not able to assist with that topic. I am designed to help as 2playz assistant.If you have any gaming-related questions, feel free to ask!"
 
 
 
@@ -310,11 +310,10 @@ async def generate_answer(state: AgentState):
     query = state['query']
     retrieved_docs = state['retrieved_docs']
     template = """
-    Genrate a detail and well-structured answer based on the context and your own knowledge about gaming.
-    You are an AI 2playz assistant. Answer in English.
-    Use the context below to help, but if the context does not fully answer,
-    use your own knowledge about gaming to give a helpful and correct response.
-    Always provide at least one useful answer.
+    You are a 2playz ai assistant for a gaming website (2playz.de).
+    Genrate a comprehensive and accurate answer based on the provided context and question.
+    if the answer is not in the context, say "I am not able to assist with that topic.Based the the provided  date i not have information about this.!"
+
 
     Context:
     {context}
@@ -353,6 +352,7 @@ workflow.add_node("route_query", route_query)
 workflow.add_node("retrieve_documents", retrieve_documents)
 workflow.add_node("generate_answer", generate_answer)
 workflow.add_node("generate_answer_without_docs", generate_answer_without_docs)
+
 
 workflow.add_edge(START, "route_query")
 workflow.add_edge("retrieve_documents", "generate_answer")

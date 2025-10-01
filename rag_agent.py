@@ -58,7 +58,7 @@ try:
         openai_api_key=OPENAI_API_KEY,
     )
 
-    db = FAISS.load_local("faiss_index2", embeddings, allow_dangerous_deserialization=True)
+    db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
     retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 2})
 except Exception as e:
     print(f"Error loading models or FAISS index: {e}")
@@ -276,12 +276,12 @@ def route_query(state: AgentState):
     else:
         return Command(goto="generate_answer_without_docs", update={"router_decision": "llm"})
 
-async def generate_answer_without_docs(state: AgentState):
+async def generate_answer_without_docs(state: AgentState, websocket_manager=None, client_id=None):
     print("---NODE: GENERATING ANSWER (NO RETRIEVAL)---")
     messages = state['messages']
     history_str = "\n".join(f"{msg.type.capitalize()}: {msg.content}" for msg in messages)
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "you are a helpful 2playz assistant for 2playz website . this is game nes and blog related websit Answer in English and use history to answer."),
+        ("system", "you are a helpful 2playz assistant for 2playz website . this is game and blog related websit Answer in English and use history to answer."),
         ("human", "{history}"),
     ])
     
@@ -295,6 +295,17 @@ async def generate_answer_without_docs(state: AgentState):
         if hasattr(chunk, 'content') and chunk.content:
             print(chunk.content, end="", flush=True)
             answer += chunk.content
+            
+            # Send chunk via WebSocket if available
+            if websocket_manager and client_id:
+                try:
+                    await websocket_manager.send_personal_message({
+                        "type": "chunk",
+                        "content": chunk.content,
+                        "metadata": {"streaming": True}
+                    }, client_id)
+                except Exception as e:
+                    print(f"Error sending chunk via WebSocket: {e}")
     
     print()  # New line after streaming
     return {"messages": [AIMessage(content=answer)]}
@@ -305,21 +316,24 @@ def retrieve_documents(state: AgentState):
     retrieved_docs = retriever.invoke(query)
     return {"retrieved_docs": retrieved_docs}
 
-async def generate_answer(state: AgentState):
+async def generate_answer(state: AgentState, websocket_manager=None, client_id=None):
     print("---NODE: GENERATING ANSWER---")
     query = state['query']
     retrieved_docs = state['retrieved_docs']
     template = """
-    You are a 2playz ai assistant for a gaming website (2playz.de).
-    Genrate a comprehensive and accurate answer based on the provided context and question.
-    if the answer is not in the context, say "I am not able to assist with that topic.Based the the provided  date i not have information about this.!"
+    You are a 2playz AI assistant for a gaming website (2playz.de).
+    Generate a comprehensive and accurate answer based on the provided context and question. 
+    Always try to be helpful, clear, and friendly. 
 
+    If the answer is not in the provided context:
+    - Politely say you don’t have enough information about that topic right now.
+    - Suggest related ideas or ask the user from what related you retrive to clarify what they mean, so you can guide them better.
 
     Context:
     {context}
-    
+
     Question: {question}
-    
+
     Answer:
     """
     prompt = ChatPromptTemplate.from_template(template)
@@ -333,26 +347,36 @@ async def generate_answer(state: AgentState):
     stream = llm.astream(formatted_messages)
     answer = ""
     
-    print("Assistant: ", end="", flush=True)
+    print("", end="", flush=True)
     async for chunk in stream:
         if hasattr(chunk, 'content') and chunk.content:
             print(chunk.content, end="", flush=True)
             answer += chunk.content
+            
+            # Send chunk via WebSocket if available
+            if websocket_manager and client_id:
+                try:
+                    await websocket_manager.send_personal_message({
+                        "type": "chunk",
+                        "content": chunk.content,
+                        "metadata": {"streaming": True}
+                    }, client_id)
+                except Exception as e:
+                    print(f"Error sending chunk via WebSocket: {e}")
     
     print()  # New line after streaming
     return {"messages": [AIMessage(content=answer)], "retrieved_docs": retrieved_docs}
+
 
 
 memory = MemorySaver()
 
 workflow = StateGraph(AgentState, checkpointers=memory)
 
-
 workflow.add_node("route_query", route_query)
 workflow.add_node("retrieve_documents", retrieve_documents)
 workflow.add_node("generate_answer", generate_answer)
 workflow.add_node("generate_answer_without_docs", generate_answer_without_docs)
-
 
 workflow.add_edge(START, "route_query")
 workflow.add_edge("retrieve_documents", "generate_answer")
@@ -361,19 +385,40 @@ workflow.add_edge("generate_answer_without_docs", END)
 
 graph = workflow.compile(checkpointer=memory)
 
+# Create a streaming-enabled graph wrapper
+def create_streaming_graph(websocket_manager=None, client_id=None):
+    """Create a graph with streaming capabilities"""
+    
+    async def streaming_generate_answer_without_docs(state: AgentState):
+        return await generate_answer_without_docs(state, websocket_manager, client_id)
+    
+    async def streaming_generate_answer(state: AgentState):
+        return await generate_answer(state, websocket_manager, client_id)
+    
+    # Create new workflow with streaming functions
+    streaming_workflow = StateGraph(AgentState, checkpointers=memory)
+    streaming_workflow.add_node("route_query", route_query)
+    streaming_workflow.add_node("retrieve_documents", retrieve_documents)
+    streaming_workflow.add_node("generate_answer", streaming_generate_answer)
+    streaming_workflow.add_node("generate_answer_without_docs", streaming_generate_answer_without_docs)
+    
+    streaming_workflow.add_edge(START, "route_query")
+    streaming_workflow.add_edge("retrieve_documents", "generate_answer")
+    streaming_workflow.add_edge("generate_answer", END)
+    streaming_workflow.add_edge("generate_answer_without_docs", END)
+    
+    return streaming_workflow.compile(checkpointer=memory)
+
 print("\n--- RAG Agent initialized. ---")
 thread_uuid = uuid.uuid1()
 print(f"Thread UUID: {thread_uuid}")
 
-# --- 5. Main Execution Loop with one-time language selection ---
 USER_LANG = None  # "en" or "de"
 
 
 
 
-# -------------------------------
-# Main async loop
-# -------------------------------
+
 async def main():
     print("[info] Language detection switched to LLM-based auto-detection (multi-language).")
 

@@ -24,7 +24,8 @@ from googletrans import Translator
 import asyncio as _asyncio
 import inspect
 
-from langgraph.checkpoint.memory import MemorySaver  
+from langgraph.checkpoint.memory import MemorySaver   
+
 
 load_dotenv()
 
@@ -33,6 +34,7 @@ class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], operator.add]
     retrieved_docs: List[Document]
     query: str
+    conversation_history: List[str]
 
 # --- 2. Environment Setup & Component Loading ---
 HUGGINGFACEHUB_API_TOKEN = os.getenv("HAGGINGFACEHUB_API_TOKEN")
@@ -59,7 +61,10 @@ try:
     )
 
     db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-    retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 2})
+    retriever = db.as_retriever(
+        search_type="similarity_score_threshold",
+        search_kwargs={"score_threshold": 0.2, "k": 3}  # only return docs above threshold
+    )
 except Exception as e:
     print(f"Error loading models or FAISS index: {e}")
     raise SystemExit(1)
@@ -71,18 +76,24 @@ GUARDRAIL_SENTINEL = (
 
 
 
-def llm_input_guardrails(input_text: str) -> str:
+def llm_input_guardrails(input_text: str, history: list[str] | None = None) -> str:
     print("--- Running input guardrail moderation ---")
     # Ask the LLM to output a small JSON indicating decision and optional sanitized text.
     # This makes parsing deterministic. Example output:
     # {"decision": "ALLOW", "text": "sanitized text here"}
+    # If conversation history is provided, include a short recent-history section for context
+    history_section = ""
+    if history:
+        recent = history[-6:]
+        history_section = "\nRecent conversation history (most recent last):\n" + "\n".join(recent) + "\n\n"
+
     prompt = ChatPromptTemplate.from_template("""
     You are a strict guardrail filter for a gaming website (2playerz.de) acting as the 2playerz AI assistant.
     Your ONLY job is to decide whether the user's input should be processed (ALLOW) or blocked (BLOCK).
 
     RULES (be strict):
       - ALLOW only gaming-related topics: game news, reviews, guides, tips, game titles, gaming hardware, streamers,
-        gaming platforms, and non-offensive small talk or greetings.If the question is related to basic hello , hi or user ask about tha the working of 2playerz website then allow it.
+        gaming platforms, and non-offensive small talk or greetings.If the question is related to basic hello , hi ,name .who are you or user ask about tha the working of 2playerz website then allow it.
       - BLOCK anything not related to gaming, or anything offensive, illegal, or harmful.
 
     Output a single valid JSON object with two keys:
@@ -91,14 +102,14 @@ def llm_input_guardrails(input_text: str) -> str:
 
     IMPORTANT: Output only the JSON object and nothing else.
 
-    Input: {input_text}
+    {history_section}Input: {input_text}
     """)
 
     moderation_chain = (prompt | llm | StrOutputParser())
 
     raw = ""
     try:
-        raw = moderation_chain.invoke({"input_text": input_text})
+        raw = moderation_chain.invoke({"input_text": input_text, "history_section": history_section})
     except Exception as e:
         print(f"Guardrail LLM invocation error: {e}")
 
@@ -249,6 +260,8 @@ async def translate_back_to_user_lang(text: str, user_lang: str) -> str:
 def route_query(state: AgentState):
     print("---NODE: ROUTING QUERY---")
     query = state['query']
+    history = state.get('conversation_history', [])
+    history_text = "\n".join(history[-6:]) if history else ""
     prompt = ChatPromptTemplate.from_template("""
     You are a routing agent for a gaming website (2playerz.de). Decide whether a user query should be answered 
     directly by the LLM ("llm") or by retrieving from the RAG knowledge base ("rag").
@@ -290,9 +303,10 @@ def route_query(state: AgentState):
     Respond with only one word: "llm" or "rag".
 
     Question: {question}
+    RecentHistory: {recent_history}
     """)
     router_chain = (prompt | llm | StrOutputParser())
-    decision = router_chain.invoke({"question": query}).strip().lower()
+    decision = router_chain.invoke({"question": query, "recent_history": history_text}).strip().lower()
     print(f"---Router Decision: {decision}---")
     if "rag" in decision:
         return Command(goto="retrieve_documents", update={"router_decision": "rag"})
@@ -304,7 +318,7 @@ async def generate_answer_without_docs(state: AgentState, websocket_manager=None
     messages = state['messages']
     history_str = "\n".join(f"{msg.type.capitalize()}: {msg.content}" for msg in messages)
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are 2playerz AI assistant for 2playerz website ,this websit is related to latest gameing news update and infoemation you can read blogs from here and also find the latest market trends. this is game and blog related websit Answer in English and use history to answer."),
+        ("system", "You are 2playerz AI assistant for 2playerz website , 2Playerz.de is your portal for news and game reviews from PlayStation, Xbox, and Nintendo. Which new games have been released and how do they perform in our reviews? When will new hardware be released from Sony, Microsoft, or Nintendo, and what are their capabilities? What rumors are currently circulating, and what's the truth behind them? We'll be the first to hear about them! Answer in English and use history to answer."),
         ("human", "{history}"),
     ])
     
@@ -345,11 +359,11 @@ async def generate_answer(state: AgentState, websocket_manager=None, client_id=N
     retrieved_docs = state['retrieved_docs']
     template = """
     You are a 2playerz AI assistant for a gaming website (2playerz.de).
-    Generate a comprehensive and accurate answer based on the provided context and question. 
+    Generate a comprehensive and accurate answer based on the provided context and question.
+    Genrate answer in humnized formate. 
     Always try to be helpful, clear, and friendly. 
 
     If the answer is not in the provided context:
-    - Politely say you don’t have enough information about that topic right now.
     - Suggest related ideas or ask the user from what related you retrive to clarify what they mean, so 
         you can guide them better.
 
@@ -448,6 +462,8 @@ USER_LANG = None  # "en" or "de"
 
 async def main():
     print("[info] Language detection switched to LLM-based auto-detection (multi-language).")
+    # Keep a simple conversation history (strings) for context-aware guardrail decisions
+    conversation_history: list[str] = []
 
     while True:
         thread_id = str(thread_uuid)
@@ -481,9 +497,12 @@ async def main():
         else:
             english_query = user_query
 
+        # Record the user input into history (raw, pre-translation) for context
+        conversation_history.append(f"User: {user_query}")
+
         # 3) Sanitize/moderate via guardrail (runs on English)
         try:
-            sanitized = llm_input_guardrails(english_query)
+            sanitized = llm_input_guardrails(english_query, history=conversation_history)
         except Exception as e:
             print(f"Moderation/guardrail check failed: {e}")
             sanitized = english_query
@@ -498,13 +517,16 @@ async def main():
                 translated_guardrail = GUARDRAIL_SENTINEL
             print(f"Assistant: {translated_guardrail}")
             print("--- REQUEST BLOCKED - NO FURTHER PROCESSING ---")
+            # Append assistant block reply to history so future short replies like "yes" are judged in context
+            conversation_history.append(f"Assistant: {GUARDRAIL_SENTINEL}")
             continue
 
         # 5) Build initial state (English) and run graph workflow (unchanged)
         initial_state = {
             "messages": [HumanMessage(content=sanitized)],
             "query": sanitized,
-            "retrieved_docs": []
+            "retrieved_docs": [],
+            "conversation_history": conversation_history
         }
 
         try:
@@ -530,6 +552,9 @@ async def main():
                 except Exception as e:
                     print(f"Translation back to user language failed: {e}")
                     print(f"Assistant: {english_answer}")
+
+                # Append assistant response to conversation history to provide context for next guardrail decisions
+                conversation_history.append(f"Assistant: {english_answer}")
 
             # Print retrieved documents (sources)
             if final_state.get("retrieved_docs"):

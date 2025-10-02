@@ -1,3 +1,90 @@
+import json
+import asyncio
+import logging
+from datetime import datetime
+from typing import AsyncGenerator, Optional
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from rag_agent import run_agent_once
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="2playz RAG Agent - Minimal", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., description="User message to send to the agent")
+    thread_id: Optional[str] = Field(None, description="Thread ID for conversation continuity")
+    language: Optional[str] = Field(None, description="Preferred language (auto-detect if not provided)")
+
+
+@app.post("/chat/stream")
+async def chat_stream(request: ChatRequest):
+    """
+    Streaming endpoint that runs the agent once via `run_agent_once` and streams SSE events back:
+      - start
+      - response
+      - sources
+      - metadata
+      - end
+    """
+
+    async def generate() -> AsyncGenerator[str, None]:
+        yield f"data: {json.dumps({'type': 'start', 'content': 'Processing your request...'})}\n\n"
+
+        try:
+            result = await run_agent_once(
+                query=request.message,
+                thread_id=request.thread_id,
+                conversation_history=None,
+                config=None,
+            )
+
+            if result.get("blocked"):
+                yield f"data: {json.dumps({'type': 'blocked', 'content': result['assistant_text']})}\n\n"
+                yield f"data: {json.dumps({'type': 'end', 'content': 'blocked'})}\n\n"
+                return
+
+            # send response
+            yield f"data: {json.dumps({'type': 'response', 'content': result.get('assistant_text', '')})}\n\n"
+
+            # send sources
+            sources = result.get('sources', [])
+            if sources:
+                yield f"data: {json.dumps({'type': 'sources', 'content': sources})}\n\n"
+
+            metadata = {
+                'detected_language': result.get('detected_language'),
+                'blocked': result.get('blocked', False),
+                'thread_id': request.thread_id,
+            }
+            yield f"data: {json.dumps({'type': 'metadata', 'content': metadata})}\n\n"
+
+            yield f"data: {json.dumps({'type': 'end', 'content': 'Stream completed'})}\n\n"
+
+        except Exception as e:
+            logger.exception(f"Error running agent: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'content': 'Internal server error'})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
 import os
 import uuid
 import json

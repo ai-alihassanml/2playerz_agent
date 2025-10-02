@@ -24,7 +24,8 @@ from googletrans import Translator
 import asyncio as _asyncio
 import inspect
 
-from langgraph.checkpoint.memory import MemorySaver  
+from langgraph.checkpoint.memory import MemorySaver   
+
 
 load_dotenv()
 
@@ -33,15 +34,20 @@ class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], operator.add]
     retrieved_docs: List[Document]
     query: str
+    conversation_history: List[str]
 
 # --- 2. Environment Setup & Component Loading ---
 HUGGINGFACEHUB_API_TOKEN = os.getenv("HAGGINGFACEHUB_API_TOKEN")
 if not HUGGINGFACEHUB_API_TOKEN:
     raise ValueError("HAGGINGFACEHUB_API_TOKEN not found in environment variables.")
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-if not OPENROUTER_API_KEY:
-    raise ValueError("OPENROUTER_API_KEY not found in environment variables.")
+# OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+# if not OPENROUTER_API_KEY:
+#     raise ValueError("OPENROUTER_API_KEY not found in environment variables.")
+
+OPENAI_API_KEY= os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY not found in environment variables.")
 
 # initialize models / vector DB (adjust model names / keys as needed)
 try:
@@ -50,70 +56,96 @@ try:
         model="sentence-transformers/all-MiniLM-L6-v2"
     )
     llm = ChatOpenAI(
-        model="x-ai/grok-4-fast:free",
-        api_key=OPENROUTER_API_KEY,
-        base_url="https://openrouter.ai/api/v1"
+        model="gpt-4",
+        openai_api_key=OPENAI_API_KEY,
     )
 
-    db = FAISS.load_local("faiss_index2", embeddings, allow_dangerous_deserialization=True)
-    retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+    db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
+    retriever = db.as_retriever(
+        search_type="similarity_score_threshold",
+        search_kwargs={"score_threshold": 0.2, "k": 3}  # only return docs above threshold
+    )
 except Exception as e:
     print(f"Error loading models or FAISS index: {e}")
     raise SystemExit(1)
 
-GUARDRAIL_SENTINEL = "I am not able to assist with that topic. I am designed to help with 2playz.de related questions only."
+GUARDRAIL_SENTINEL = (
+    "I am not able to assist you with this topic. "
+    "If you have any questions related to gaming or the 2playerz website, please ask and I'll try to help."
+)
 
 
 
-def llm_input_guardrails(input_text: str) -> str:
+
+
+
+
+def llm_input_guardrails(input_text: str, history: list[str] | None = None) -> str:
     print("--- Running input guardrail moderation ---")
+    # Ask the LLM to output a small JSON indicating decision and optional sanitized text.
+    # This makes parsing deterministic. Example output:
+    # {"decision": "ALLOW", "text": "sanitized text here"}
+    # If conversation history is provided, include a short recent-history section for context
+    history_section = ""
+    if history:
+        recent = history[-6:]
+        history_section = "\nRecent conversation history (most recent last):\n" + "\n".join(recent) + "\n\n"
 
     prompt = ChatPromptTemplate.from_template("""
-    You are a strict guardrail filter for a gaming website (2playz.de).  
-    Your ONLY job is to decide if the input should be processed or blocked.  
+    You are a strict guardrail filter for a gaming website (2playerz.de) acting as the 2playerz AI assistant.
+    Your ONLY job is to decide whether the user's input should be processed (ALLOW) or blocked (BLOCK).
 
-    STRICT RULES - ONLY allow these:
-    1. Gaming-related content (games, gaming companies, esports, gaming news, reviews, guides)
-    2. Simple greetings ("hi", "hello", "good morning", "hey")
-    3. Questions about the AI assistant itself ("what is your name?", "who are you?")
-    4. Basic small talk that is gaming-related or neutral
-    5. Allow some neutral, non-gaming small talk (e.g., "how are you?", "what's your favorite color?", "My neme is [name]")
-    6 .understand the user query and i want that also ans if it is some basic chat that do any chatbot
+    RULES (be strict):
+      - ALLOW only gaming-related topics: game news, reviews, guides, tips, game titles, gaming hardware, streamers,
+        gaming platforms, and non-offensive small talk or greetings.If the question is related to basic hello , hi ,name .who are you or user ask about tha the working of 2playerz website then allow it.
+      - BLOCK anything not related to gaming, or anything offensive, illegal, or harmful.
 
-    BLOCK everything else including:
-    - Cooking, recipes, food
-    - Weather, travel, politics
-    - Science, math, programming (unless gaming-related)
-    - Personal life, relationships, health
-    - Business, finance, work
-    - books, music (unless gaming-related)
-    - Any other non-gaming topics
+    Output a single valid JSON object with two keys:
+      - "decision": either "ALLOW" or "BLOCK"
+      - "text": the sanitized text to use (for ALLOW) or an explanatory short phrase (for BLOCK)
 
-    If the input is ALLOWED → output EXACTLY the same input.
-    If the input should be BLOCKED → output EXACTLY: "{GUARDRAIL_SENTINEL}".
+    IMPORTANT: Output only the JSON object and nothing else.
 
-    Do NOT answer the question.  
-    Do NOT rephrase or change the input.  
-    Just return either the original input or the sentinel.  
-
-    Input: {input_text}
-
-    Output:
+    {history_section}Input: {input_text}
     """)
 
-    moderation_chain = (
-        prompt
-        | llm
-        | StrOutputParser()
-    )
+    moderation_chain = (prompt | llm | StrOutputParser())
 
-    result = moderation_chain.invoke({
-        "input_text": input_text,
-        "GUARDRAIL_SENTINEL": GUARDRAIL_SENTINEL
-    })
+    raw = ""
+    try:
+        raw = moderation_chain.invoke({"input_text": input_text, "history_section": history_section})
+    except Exception as e:
+        print(f"Guardrail LLM invocation error: {e}")
 
-    print(f"Guardrail output: {result!r}")
-    return result
+    print(f"Guardrail raw output: {raw!r}")
+
+    # Try to parse JSON first
+    try:
+        parsed = json.loads(raw.strip())
+        decision = str(parsed.get("decision", "BLOCK")).upper()
+        text = parsed.get("text", "")
+    except Exception:
+        # Fallback: do a keyword-based parse
+        lowered = (raw or "").lower()
+        if "allow" in lowered and "block" not in lowered:
+            decision = "ALLOW"
+            text = input_text
+        elif "block" in lowered:
+            decision = "BLOCK"
+            text = ""
+        else:
+            # If unsure, default to BLOCK for safety
+            decision = "BLOCK"
+            text = ""
+
+    if decision == "BLOCK":
+        print("Guardrail decision: BLOCK - returning sentinel")
+        return GUARDRAIL_SENTINEL
+
+    # If allowed, return sanitized text if provided, otherwise return original input
+    sanitized = text.strip() if isinstance(text, str) and text.strip() else input_text
+    print("Guardrail decision: ALLOW - passing through sanitized text")
+    return sanitized
 
 
 
@@ -232,11 +264,15 @@ async def translate_back_to_user_lang(text: str, user_lang: str) -> str:
 def route_query(state: AgentState):
     print("---NODE: ROUTING QUERY---")
     query = state['query']
+    history = state.get('conversation_history', [])
+    history_text = "\n".join(history[-6:]) if history else ""
     prompt = ChatPromptTemplate.from_template("""
-    You are a routing agent for a gaming website (2playz.de). Decide whether a user query should be answered 
+    You are a routing agent for a gaming website (2playerz.de). Decide whether a user query should be answered 
     directly by the LLM ("llm") or by retrieving from the RAG knowledge base ("rag").
 
     IMPORTANT: When in doubt, prefer "rag" for any gaming-related content.
+             - and if user query is block then prefer "llm" to handle it gracefully.
+             - If querry is about 2playerz website or basic hello then prefer "llm" to handle it gracefully.
 
     Rules:
     - Use "llm" ONLY for:
@@ -271,25 +307,48 @@ def route_query(state: AgentState):
     Respond with only one word: "llm" or "rag".
 
     Question: {question}
+    RecentHistory: {recent_history}
     """)
     router_chain = (prompt | llm | StrOutputParser())
-    decision = router_chain.invoke({"question": query}).strip().lower()
+    decision = router_chain.invoke({"question": query, "recent_history": history_text}).strip().lower()
     print(f"---Router Decision: {decision}---")
     if "rag" in decision:
         return Command(goto="retrieve_documents", update={"router_decision": "rag"})
     else:
         return Command(goto="generate_answer_without_docs", update={"router_decision": "llm"})
 
-def generate_answer_without_docs(state: AgentState):
+async def generate_answer_without_docs(state: AgentState, websocket_manager=None, client_id=None):
     print("---NODE: GENERATING ANSWER (NO RETRIEVAL)---")
     messages = state['messages']
     history_str = "\n".join(f"{msg.type.capitalize()}: {msg.content}" for msg in messages)
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "you are a helpful assistant for 2playz website. Ans the user in full human-like sentences. Answer in English and use history to answer."),
+        ("system", "You are 2playerz AI assistant for 2playerz website , 2Playerz.de is your portal for news and game reviews from PlayStation, Xbox, and Nintendo. Which new games have been released and how do they perform in our reviews? When will new hardware be released from Sony, Microsoft, or Nintendo, and what are their capabilities? What rumors are currently circulating, and what's the truth behind them? We'll be the first to hear about them! Answer in English and use history to answer."),
         ("human", "{history}"),
     ])
-    llm_chain = (prompt | llm | StrOutputParser())
-    answer = llm_chain.invoke({"history": history_str})
+    
+    # Stream the response
+    formatted_messages = prompt.format_messages(history=history_str)
+    stream = llm.astream(formatted_messages)
+    answer = ""
+    
+    print("Assistant: ", end="", flush=True)
+    async for chunk in stream:
+        if hasattr(chunk, 'content') and chunk.content:
+            print(chunk.content, end="", flush=True)
+            answer += chunk.content
+            
+            # Send chunk via WebSocket if available
+            if websocket_manager and client_id:
+                try:
+                    await websocket_manager.send_personal_message({
+                        "type": "chunk",
+                        "content": chunk.content,
+                        "metadata": {"streaming": True}
+                    }, client_id)
+                except Exception as e:
+                    print(f"Error sending chunk via WebSocket: {e}")
+    
+    print()  # New line after streaming
     return {"messages": [AIMessage(content=answer)]}
 
 def retrieve_documents(state: AgentState):
@@ -298,22 +357,28 @@ def retrieve_documents(state: AgentState):
     retrieved_docs = retriever.invoke(query)
     return {"retrieved_docs": retrieved_docs}
 
-def generate_answer(state: AgentState):
+async def generate_answer(state: AgentState, websocket_manager=None, client_id=None):
     print("---NODE: GENERATING ANSWER---")
     query = state['query']
     retrieved_docs = state['retrieved_docs']
     template = """
-    You are an AI assistant for 2playz website. Answer in English.
-    Use the following context to answer the question.
-    If the answer is not in the context, say you don't know.
-    Give a detailed, well-structured answer based on the context.
-    Understand the question fully and answer it in detail.
+    You are a 2playerz AI assistant for a gaming website (2playerz.de).
+    Generate a comprehensive and accurate answer based on the provided context and question.
+    Genrate answer in humnized formate. 
+    Always try to be helpful, clear, and friendly. 
+
+    If the answer is not in the provided context:
+    - Suggest related ideas or ask the user from what related you retrive to clarify what they mean, so 
+        you can guide them better.
+
+    - If the question is block then.
+     ans : I am not design to assist with that topic. I am designed to help as 2playerz assistant.If you have any gaming-related questions, feel free to ask!
 
     Context:
     {context}
-    
+
     Question: {question}
-    
+
     Answer:
     """
     prompt = ChatPromptTemplate.from_template(template)
@@ -321,14 +386,38 @@ def generate_answer(state: AgentState):
         f"Title: {doc.metadata.get('title','N/A')}\nSlug: {doc.metadata.get('slug','N/A')}\nContent: {doc.page_content}"
         for doc in retrieved_docs
     )
-    qa_chain = (prompt | llm | StrOutputParser())
-    answer = qa_chain.invoke({"context": context_str, "question": query})
+    
+    # Stream the response
+    formatted_messages = prompt.format_messages(context=context_str, question=query)
+    stream = llm.astream(formatted_messages)
+    answer = ""
+    
+    print("", end="", flush=True)
+    async for chunk in stream:
+        if hasattr(chunk, 'content') and chunk.content:
+            print(chunk.content, end="", flush=True)
+            answer += chunk.content
+            
+            # Send chunk via WebSocket if available
+            if websocket_manager and client_id:
+                try:
+                    await websocket_manager.send_personal_message({
+                        "type": "chunk",
+                        "content": chunk.content,
+                        "metadata": {"streaming": True}
+                    }, client_id)
+                except Exception as e:
+                    print(f"Error sending chunk via WebSocket: {e}")
+    
+    print()  # New line after streaming
     return {"messages": [AIMessage(content=answer)], "retrieved_docs": retrieved_docs}
 
-# --- 4. Build and Compile the Graph ---
+
+
 memory = MemorySaver()
 
 workflow = StateGraph(AgentState, checkpointers=memory)
+
 workflow.add_node("route_query", route_query)
 workflow.add_node("retrieve_documents", retrieve_documents)
 workflow.add_node("generate_answer", generate_answer)
@@ -341,21 +430,47 @@ workflow.add_edge("generate_answer_without_docs", END)
 
 graph = workflow.compile(checkpointer=memory)
 
+# Create a streaming-enabled graph wrapper
+def create_streaming_graph(websocket_manager=None, client_id=None):
+    """Create a graph with streaming capabilities"""
+    
+    async def streaming_generate_answer_without_docs(state: AgentState):
+        return await generate_answer_without_docs(state, websocket_manager, client_id)
+    
+    async def streaming_generate_answer(state: AgentState):
+        return await generate_answer(state, websocket_manager, client_id)
+    
+    # Create new workflow with streaming functions
+    streaming_workflow = StateGraph(AgentState, checkpointers=memory)
+    streaming_workflow.add_node("route_query", route_query)
+    streaming_workflow.add_node("retrieve_documents", retrieve_documents)
+    streaming_workflow.add_node("generate_answer", streaming_generate_answer)
+    streaming_workflow.add_node("generate_answer_without_docs", streaming_generate_answer_without_docs)
+    
+    streaming_workflow.add_edge(START, "route_query")
+    streaming_workflow.add_edge("retrieve_documents", "generate_answer")
+    streaming_workflow.add_edge("generate_answer", END)
+    streaming_workflow.add_edge("generate_answer_without_docs", END)
+    
+    return streaming_workflow.compile(checkpointer=memory)
+
 print("\n--- RAG Agent initialized. ---")
 thread_uuid = uuid.uuid1()
 print(f"Thread UUID: {thread_uuid}")
 
-# --- 5. Main Execution Loop with one-time language selection ---
 USER_LANG = None  # "en" or "de"
 
 
 
 
-# -------------------------------
-# Main async loop
-# -------------------------------
+
 async def main():
+    """
+    Interactive CLI entrypoint (keeps backward-compatible behaviour).
+    Internally this uses ``run_agent_once`` to perform one agent run and print results.
+    """
     print("[info] Language detection switched to LLM-based auto-detection (multi-language).")
+    conversation_history: list[str] = []
 
     while True:
         thread_id = str(thread_uuid)
@@ -368,84 +483,182 @@ async def main():
         if not user_query:
             continue
 
-        # 1) LLM detects the user's language & whether it's a question
+        # Call the new helper which returns a structured result
         try:
-            detect_info = llm_detect_language_and_intent(user_query)
-            detected_lang = detect_info.get("language", "en")
-            is_question = detect_info.get("is_question", False)
-            print(f"[detect] lang={detected_lang} is_question={is_question} conf={detect_info.get('confidence')}")
-        except Exception as e:
-            print(f"Language detection failed: {e}")
-            detected_lang = "en"
-            is_question = user_query.strip().endswith("?")
-
-        # 2) Translate to English (for processing) if needed
-        if detected_lang and detected_lang != "en":
-            try:
-                english_query = await translate_text_async(user_query, src=detected_lang, dest="en")
-            except Exception as e:
-                print(f"Translation to English failed: {e}")
-                english_query = user_query
-        else:
-            english_query = user_query
-
-        # 3) Sanitize/moderate via guardrail (runs on English)
-        try:
-            sanitized = llm_input_guardrails(english_query)
-        except Exception as e:
-            print(f"Moderation/guardrail check failed: {e}")
-            sanitized = english_query
-
-        # 4) Guardrail sentinel handling - BLOCK the request and stop processing
-        if isinstance(sanitized, str) and sanitized.strip() == GUARDRAIL_SENTINEL:
-            print(f"\n--- GUARDRAIL BLOCKED REQUEST ---")
-            try:
-                translated_guardrail = await translate_text_async(GUARDRAIL_SENTINEL, src="en", dest=detected_lang)
-            except Exception as e:
-                print(f"Translation of guardrail failed: {e}")
-                translated_guardrail = GUARDRAIL_SENTINEL
-            print(f"Assistant: {translated_guardrail}")
-            print("--- REQUEST BLOCKED - NO FURTHER PROCESSING ---")
-            continue
-
-        # 5) Build initial state (English) and run graph workflow (unchanged)
-        initial_state = {
-            "messages": [HumanMessage(content=sanitized)],
-            "query": sanitized,
-            "retrieved_docs": []
-        }
-
-        try:
-            final_state = graph.invoke(initial_state, config=config)
-            english_answer = final_state["messages"][-1].content
-
-            # 6) Translate back to user language (if needed)
-            if detected_lang and detected_lang != "en":
-                try:
-                    final_response = await translate_text_async(english_answer, src="en", dest=detected_lang)
-                except Exception as e:
-                    print(f"Translation back to user language failed: {e}")
-                    final_response = english_answer
-            else:
-                final_response = english_answer
-
-            print("\n--- Agent's Final Response ---")
-            print(f"Assistant: {final_response}")
-
-            # Print retrieved documents (sources)
-            if final_state.get("retrieved_docs"):
-                print("\n--- Retrieved Documents (sources) ---")
-                for doc in final_state["retrieved_docs"]:
-                    slug = doc.metadata.get("slug", "N/A")
-                    title = doc.metadata.get("title", "N/A")
-                    print(f"Title: {title}\nSlug: {slug}\nExcerpt: {doc.page_content[:150]}...\n")
-            else:
-                print("\n--- Retrieved Documents (sources) ---\nNone")
-
+            result = await run_agent_once(
+                query=user_query,
+                thread_id=thread_id,
+                conversation_history=conversation_history,
+                config=config,
+            )
         except Exception as e:
             print(f"An error occurred during agent execution: {e}")
+            continue
+
+        # result is a dict with standardized keys; print helpful bits
+        assistant_text = result.get("assistant_text", "")
+        detected_lang = result.get("detected_language", "en")
+
+        if assistant_text:
+            print("\nAssistant: ", assistant_text)
+
+        if result.get("blocked"):
+            print("\n--- GUARDRAIL BLOCKED REQUEST ---")
+
+        # Print retrieved documents (sources)
+        sources = result.get("retrieved_docs") or []
+        if sources:
+            print("\n--- Retrieved Documents (sources) ---")
+            for doc in sources:
+                slug = getattr(doc, 'metadata', {}).get('slug', 'N/A') if doc else 'N/A'
+                title = getattr(doc, 'metadata', {}).get('title', 'N/A') if doc else 'N/A'
+                excerpt = getattr(doc, 'page_content', '')[:150] if doc else ''
+                print(f"Title: {title}\nSlug: {slug}\nExcerpt: {excerpt}...\n")
+        else:
+            print("\n--- Retrieved Documents (sources) ---\nNone")
+
+
+# Example usage from another module or API server:
+#
+# import asyncio
+# from rag_agent import run_agent_once
+#
+# result = asyncio.run(run_agent_once("tell me about FIFA 24", thread_id="api-1"))
+# print(result["assistant_text"])  # final assistant text (English)
+# print(result["blocked"])        # True if guardrail blocked the request
+# print(result["sources"])        # list of dicts: title, slug, content, excerpt
+#
+async def run_agent_once(query: str, thread_id: str | None = None, conversation_history: list[str] | None = None, config: dict | None = None) -> dict:
+    """
+    Perform one agent run for the given `query`.
+
+    Returns a dict with keys:
+      - blocked: bool (True if guardrail blocked the query)
+      - assistant_text: str (final assistant text in English)
+      - detected_language: str (ISO code)
+      - retrieved_docs: list[Document]
+      - raw_state: final state returned by the graph (if any)
+
+    This function does: language detection, optional translation to English,
+    guardrail check, graph invocation, and returns the structured result.
+    """
+    if conversation_history is None:
+        conversation_history = []
+
+    thread_id = thread_id or str(thread_uuid)
+    cfg = config or {"configurable": {"thread_id": thread_id}}
+
+    # 1) Detect language & intent
+    try:
+        detect_info = llm_detect_language_and_intent(query)
+        detected_lang = detect_info.get("language", "en")
+        is_question = detect_info.get("is_question", False)
+    except Exception as e:
+        detected_lang = "en"
+        is_question = query.strip().endswith("?")
+
+    # 2) Translate to English if needed
+    if detected_lang and detected_lang != "en":
+        try:
+            english_query = await translate_text_async(query, src=detected_lang, dest="en")
+        except Exception:
+            english_query = query
+    else:
+        english_query = query
+
+    # Save raw user to history
+    conversation_history.append(f"User: {query}")
+
+    # 3) Guardrail moderation
+    try:
+        sanitized = llm_input_guardrails(english_query, history=conversation_history)
+    except Exception:
+        sanitized = english_query
+
+    # Handle blocked
+    if isinstance(sanitized, str) and sanitized.strip() == GUARDRAIL_SENTINEL:
+        # append assistant sentinel and return blocked
+        conversation_history.append(f"Assistant: {GUARDRAIL_SENTINEL}")
+        return {
+            "blocked": True,
+            "assistant_text": GUARDRAIL_SENTINEL,
+            "detected_language": detected_lang,
+            "retrieved_docs": [],
+            "raw_state": None,
+        }
+
+    # 4) Build initial state and invoke graph
+    initial_state = {
+        "messages": [HumanMessage(content=sanitized)],
+        "query": sanitized,
+        "retrieved_docs": [],
+        "conversation_history": conversation_history,
+    }
+
+    final_state = None
+    try:
+        final_state = await graph.ainvoke(initial_state, config=cfg)
+    except Exception as e:
+        # propagate as part of result
+        return {
+            "blocked": False,
+            "assistant_text": "",
+            "detected_language": detected_lang,
+            "retrieved_docs": [],
+            "raw_state": None,
+            "error": str(e),
+        }
+
+    assistant_text = ""
+    if final_state and final_state.get("messages"):
+        assistant_text = final_state["messages"][-1].content
+
+    # append assistant to conversation history
+    conversation_history.append(f"Assistant: {assistant_text}")
+
+    retrieved = final_state.get("retrieved_docs") if final_state else []
+    # Build lightweight sources list for API consumers
+    sources = []
+    for doc in (retrieved or []):
+        try:
+            meta = getattr(doc, 'metadata', {}) or {}
+            title = meta.get('title', meta.get('Title', 'N/A'))
+            slug = meta.get('slug', meta.get('Slug', 'N/A'))
+            content = getattr(doc, 'page_content', '')
+            excerpt = content[:400]
+            sources.append({
+                'title': title,
+                'slug': slug,
+                'content': content,
+                'excerpt': excerpt,
+                'metadata': meta,
+            })
+        except Exception:
+            # best-effort: include minimal representation
+            sources.append({'title': 'N/A', 'slug': 'N/A', 'content': '', 'excerpt': ''})
+
+    return {
+        "blocked": False,
+        "assistant_text": assistant_text,
+        "detected_language": detected_lang,
+        "retrieved_docs": retrieved,
+        "sources": sources,
+        "raw_state": final_state,
+    }
 
 
 # Run the async loop
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
+
+
+
+
+
+
+
+
+

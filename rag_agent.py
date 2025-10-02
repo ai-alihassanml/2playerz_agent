@@ -61,9 +61,13 @@ try:
     )
 
     db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
+    # Use similarity search (top-k) by default. The previous "similarity_score_threshold" mode
+    # expects normalized relevance scores in [0,1], but FAISS may return raw distances or unnormalized
+    # scores leading to unexpected filtering. Using plain similarity (k) and adding a fallback in
+    # `retrieve_documents` ensures we still return top candidates when thresholding filters them out.
     retriever = db.as_retriever(
-        search_type="similarity_score_threshold",
-        search_kwargs={"score_threshold": 0.2, "k": 3}  # only return docs above threshold
+        search_type="similarity",
+        search_kwargs={"k": 3}
     )
 except Exception as e:
     print(f"Error loading models or FAISS index: {e}")
@@ -76,7 +80,7 @@ GUARDRAIL_SENTINEL = (
 
 
 
-
+BASE_URL = "https://2playerz.de/p/"
 
 
 
@@ -246,8 +250,6 @@ async def translate_text_async(text: str, src: str, dest: str) -> str:
         return text
 
 
-
-
 # Convenience wrappers using the new async translate_text_async
 async def detect_and_translate_to_english(text: str, user_lang: str) -> str:
     if not user_lang or user_lang == "en":
@@ -354,7 +356,26 @@ async def generate_answer_without_docs(state: AgentState, websocket_manager=None
 def retrieve_documents(state: AgentState):
     print("---NODE: RETRIEVING DOCUMENTS---")
     query = state['query']
-    retrieved_docs = retriever.invoke(query)
+    # First try the configured retriever (top-k similarity)
+    try:
+        retrieved_docs = retriever.invoke(query)
+    except Exception as e:
+        print(f"Retriever invocation error: {e}")
+        retrieved_docs = []
+
+    # If no docs were returned (for example due to unexpected relevance-score behavior),
+    # fall back to FAISS similarity_search_with_relevance_scores to fetch top-k candidates
+    # and ignore any score thresholding issues.
+    try:
+        if not retrieved_docs:
+            print("No docs returned by retriever; falling back to FAISS top-k similarity search")
+            # similarity_search_with_relevance_scores returns list of (Document, score)
+            raw = db.similarity_search_with_relevance_scores(query, k=3)
+            # extract just the Document objects
+            retrieved_docs = [t[0] for t in raw]
+    except Exception as e:
+        print(f"Fallback FAISS search error: {e}")
+
     return {"retrieved_docs": retrieved_docs}
 
 async def generate_answer(state: AgentState, websocket_manager=None, client_id=None):
@@ -387,7 +408,31 @@ async def generate_answer(state: AgentState, websocket_manager=None, client_id=N
         for doc in retrieved_docs
     )
     
-    # Stream the response
+    # If the user explicitly asked for blog links / posts, return a brief summary + links
+    link_request_keywords = ["blog", "blogs", "link", "links", "post", "posts", "read more", "blog post", "give me links", "give me blog links", "show me links", "sources"]
+    lowered = (query or "").lower()
+    is_link_request = any(k in lowered for k in link_request_keywords)
+
+    if is_link_request and retrieved_docs:
+        # Build a compact, human-friendly list of blog links using BASE_URL + slug
+        parts = ["Here are the related blog posts I found:\n"]
+        for doc in retrieved_docs:
+            title = doc.metadata.get("title", "(untitled)")
+            slug = doc.metadata.get("slug")
+            excerpt = (doc.page_content or "").strip().replace("\n", " ")[:200]
+            if slug:
+                url = BASE_URL.rstrip('/') + '/' + slug.lstrip('/')
+                parts.append(f"- {title}: {excerpt}...\n  Link: {url}\n")
+            else:
+                # If no slug is present, include title + excerpt but no link
+                parts.append(f"- {title}: {excerpt}...\n  Link: (no slug available)\n")
+
+        answer = "\n".join(parts)
+        # Send a single response (no streaming) and include retrieved_docs for provenance
+        print(answer)
+        return {"messages": [AIMessage(content=answer)], "retrieved_docs": retrieved_docs}
+
+    # Stream the response (default behavior)
     formatted_messages = prompt.format_messages(context=context_str, question=query)
     stream = llm.astream(formatted_messages)
     answer = ""
@@ -408,7 +453,7 @@ async def generate_answer(state: AgentState, websocket_manager=None, client_id=N
                     }, client_id)
                 except Exception as e:
                     print(f"Error sending chunk via WebSocket: {e}")
-    
+
     print()  # New line after streaming
     return {"messages": [AIMessage(content=answer)], "retrieved_docs": retrieved_docs}
 

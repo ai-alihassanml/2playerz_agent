@@ -64,52 +64,73 @@ except Exception as e:
     print(f"Error loading models or FAISS index: {e}")
     raise SystemExit(1)
 
-GUARDRAIL_SENTINEL = "I am not able to assist with that topic. I am designed to help as 2playz assistant.If you have any gaming-related questions, feel free to ask!"
+GUARDRAIL_SENTINEL = (
+    "I am not able to assist you with this topic. "
+    "If you have any questions related to gaming or the 2playerz website, please ask and I'll try to help."
+)
 
 
 
 def llm_input_guardrails(input_text: str) -> str:
     print("--- Running input guardrail moderation ---")
-
+    # Ask the LLM to output a small JSON indicating decision and optional sanitized text.
+    # This makes parsing deterministic. Example output:
+    # {"decision": "ALLOW", "text": "sanitized text here"}
     prompt = ChatPromptTemplate.from_template("""
-    You are a strict guardrail filter for a gaming website (2playz.de).  
-    Your ONLY job is to decide if the input should be processed or blocked.  
+    You are a strict guardrail filter for a gaming website (2playerz.de) acting as the 2playerz AI assistant.
+    Your ONLY job is to decide whether the user's input should be processed (ALLOW) or blocked (BLOCK).
 
-    STRICT RULES - ONLY allow these:
-    1. Gaming-related content (games, gaming companies, esports, gaming news, reviews, guides)
-    2. Simple greetings ("hi", "hello", "good morning", "hey" , what is my name? etc)
-    3. Questions about the AI assistant itself ("what is your name?", "who are you?")
-    4. Basic small talk that is gaming-related or neutral
-    5 .i want that understand the user question and if a simple chatbot can answer it then allow it
+    RULES (be strict):
+      - ALLOW only gaming-related topics: game news, reviews, guides, tips, game titles, gaming hardware, streamers,
+        gaming platforms, and non-offensive small talk or greetings.If the question is related to basic hello , hi or user ask about tha the working of 2playerz website then allow it.
+      - BLOCK anything not related to gaming, or anything offensive, illegal, or harmful.
 
-    BLOCK everything else including:
-    - Not Allowed topics: politics, religion, adult content, violence, hate speech, illegal activities, personal data requests
+    Output a single valid JSON object with two keys:
+      - "decision": either "ALLOW" or "BLOCK"
+      - "text": the sanitized text to use (for ALLOW) or an explanatory short phrase (for BLOCK)
 
-    If the input is ALLOWED → output EXACTLY the same input.
-    If the input should be BLOCKED → output EXACTLY: "{GUARDRAIL_SENTINEL}".
-
-    Do NOT answer the question.  
-    Do NOT rephrase or change the input.  
-    Just return either the original input or the sentinel.  
+    IMPORTANT: Output only the JSON object and nothing else.
 
     Input: {input_text}
-
-    Output:
     """)
 
-    moderation_chain = (
-        prompt
-        | llm
-        | StrOutputParser()
-    )
+    moderation_chain = (prompt | llm | StrOutputParser())
 
-    result = moderation_chain.invoke({
-        "input_text": input_text,
-        "GUARDRAIL_SENTINEL": GUARDRAIL_SENTINEL
-    })
+    raw = ""
+    try:
+        raw = moderation_chain.invoke({"input_text": input_text})
+    except Exception as e:
+        print(f"Guardrail LLM invocation error: {e}")
 
-    print(f"Guardrail output: {result!r}")
-    return result
+    print(f"Guardrail raw output: {raw!r}")
+
+    # Try to parse JSON first
+    try:
+        parsed = json.loads(raw.strip())
+        decision = str(parsed.get("decision", "BLOCK")).upper()
+        text = parsed.get("text", "")
+    except Exception:
+        # Fallback: do a keyword-based parse
+        lowered = (raw or "").lower()
+        if "allow" in lowered and "block" not in lowered:
+            decision = "ALLOW"
+            text = input_text
+        elif "block" in lowered:
+            decision = "BLOCK"
+            text = ""
+        else:
+            # If unsure, default to BLOCK for safety
+            decision = "BLOCK"
+            text = ""
+
+    if decision == "BLOCK":
+        print("Guardrail decision: BLOCK - returning sentinel")
+        return GUARDRAIL_SENTINEL
+
+    # If allowed, return sanitized text if provided, otherwise return original input
+    sanitized = text.strip() if isinstance(text, str) and text.strip() else input_text
+    print("Guardrail decision: ALLOW - passing through sanitized text")
+    return sanitized
 
 
 
@@ -229,10 +250,12 @@ def route_query(state: AgentState):
     print("---NODE: ROUTING QUERY---")
     query = state['query']
     prompt = ChatPromptTemplate.from_template("""
-    You are a routing agent for a gaming website (2playz.de). Decide whether a user query should be answered 
+    You are a routing agent for a gaming website (2playerz.de). Decide whether a user query should be answered 
     directly by the LLM ("llm") or by retrieving from the RAG knowledge base ("rag").
 
     IMPORTANT: When in doubt, prefer "rag" for any gaming-related content.
+             - and if user query is block then prefer "llm" to handle it gracefully.
+             - If querry is about 2playerz website or basic hello then prefer "llm" to handle it gracefully.
 
     Rules:
     - Use "llm" ONLY for:
@@ -281,7 +304,7 @@ async def generate_answer_without_docs(state: AgentState, websocket_manager=None
     messages = state['messages']
     history_str = "\n".join(f"{msg.type.capitalize()}: {msg.content}" for msg in messages)
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "you are a helpful 2playz assistant for 2playz website . this is game and blog related websit Answer in English and use history to answer."),
+        ("system", "You are 2playerz AI assistant for 2playerz website ,this websit is related to latest gameing news update and infoemation you can read blogs from here and also find the latest market trends. this is game and blog related websit Answer in English and use history to answer."),
         ("human", "{history}"),
     ])
     
@@ -321,13 +344,17 @@ async def generate_answer(state: AgentState, websocket_manager=None, client_id=N
     query = state['query']
     retrieved_docs = state['retrieved_docs']
     template = """
-    You are a 2playz AI assistant for a gaming website (2playz.de).
+    You are a 2playerz AI assistant for a gaming website (2playerz.de).
     Generate a comprehensive and accurate answer based on the provided context and question. 
     Always try to be helpful, clear, and friendly. 
 
     If the answer is not in the provided context:
     - Politely say you don’t have enough information about that topic right now.
-    - Suggest related ideas or ask the user from what related you retrive to clarify what they mean, so you can guide them better.
+    - Suggest related ideas or ask the user from what related you retrive to clarify what they mean, so 
+        you can guide them better.
+
+    - If the question is block then.
+     ans : I am not design to assist with that topic. I am designed to help as 2playerz assistant.If you have any gaming-related questions, feel free to ask!
 
     Context:
     {context}

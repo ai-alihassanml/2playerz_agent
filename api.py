@@ -206,6 +206,9 @@ async def get_status():
         ]
     }
 
+
+
+
 @app.get("/threads")
 async def get_threads():
     """Get information about active threads"""

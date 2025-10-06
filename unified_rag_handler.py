@@ -441,25 +441,18 @@ class UnifiedRAGHandler:
                 "conversation_history": conversation_history or []
             }
             
-            # 5) Run the graph and get the response
+            # 5) Run the graph with streaming
             yield {
                 "type": "routing",
                 "content": "Generating response...",
                 "metadata": {"step": "generation"}
             }
             
-            # Run the graph - this will complete the processing
+            # Run the graph with streaming support
             final_state = await graph.ainvoke(initial_state, config=config)
             english_answer = final_state["messages"][-1].content
             
-            # Stream the complete response immediately (no artificial word-by-word delay)
-            yield {
-                "type": "response",
-                "content": english_answer,
-                "metadata": {"streaming": True, "complete": True}
-            }
-            
-            # 6) Translate back if needed
+            # 6) Translate back if needed BEFORE streaming
             if detected_lang and detected_lang != "en":
                 yield {
                     "type": "processing",
@@ -481,6 +474,16 @@ class UnifiedRAGHandler:
                     translated_response = english_answer
             else:
                 translated_response = english_answer
+            
+            # Stream the TRANSLATED response word by word for better user experience
+            words = translated_response.split()
+            for i, word in enumerate(words):
+                yield {
+                    "type": "chunk",
+                    "content": word + (" " if i < len(words) - 1 else ""),
+                    "metadata": {"streaming": True, "thread_id": thread_id}
+                }
+                # No artificial delay - let the natural streaming happen
 
             # 7) Process sources
             sources = []

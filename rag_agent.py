@@ -324,7 +324,7 @@ async def generate_answer_without_docs(state: AgentState, websocket_manager=None
     messages = state['messages']
     history_str = "\n".join(f"{msg.type.capitalize()}: {msg.content}" for msg in messages)
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are 2playerz AI assistant for 2playerz website , 2Playerz.de is your portal for news and game reviews from PlayStation, Xbox, and Nintendo. Which new games have been released and how do they perform in our reviews? When will new hardware be released from Sony, Microsoft, or Nintendo, and what are their capabilities? What rumors are currently circulating, and what's the truth behind them? We'll be the first to hear about them! Answer in English and use history to answer."),
+        ("system", "You are 2playerz AI assistant for 2playerz website , 2Playerz.de is your portal for news and game reviews from PlayStation, Xbox, and Nintendo. Which new games have been released and how do they perform in our reviews? When will new hardware be released from Sony, Microsoft, or Nintendo, and what are their capabilities? What rumors are currently circulating, and what's the truth behind them? We'll be the first to hear about them! IMPORTANT: You MUST respond ONLY in English. Do not switch to any other language during your response. Keep your entire response consistent in English throughout. Never use German, French, Spanish, or any other language. If you start a response in English, continue in English for the entire response. Answer in English and use history to answer."),
         ("human", "{history}"),
     ])
     
@@ -385,15 +385,19 @@ async def generate_answer(state: AgentState, websocket_manager=None, client_id=N
     template = """
     You are a 2playerz AI assistant for a gaming website (2playerz.de).
     Generate a comprehensive and accurate answer based on the provided context and question.
-    Genrate answer in humnized formate. 
+    Generate answer in humanized format. 
     Always try to be helpful, clear, and friendly. 
+    
+    IMPORTANT: You MUST respond ONLY in English. Do not switch to any other language during your response.
+    Keep your entire response consistent in English throughout. Never use German, French, Spanish, or any other language.
+    If you start a response in English, continue in English for the entire response.
 
     If the answer is not in the provided context:
-    - Suggest related ideas or ask the user from what related you retrive to clarify what they mean, so 
+    - Suggest related ideas or ask the user from what related you retrieve to clarify what they mean, so 
         you can guide them better.
 
-    - If the question is block then.
-     ans : I am not design to assist with that topic. I am designed to help as 2playerz assistant.If you have any gaming-related questions, feel free to ask!
+    - If the question is blocked then.
+     ans : I am not designed to assist with that topic. I am designed to help as 2playerz assistant. If you have any gaming-related questions, feel free to ask!
 
     Context:
     {context}

@@ -159,8 +159,7 @@ async def chat_stream(request: ChatRequest):
                     event_data = json.dumps(event, ensure_ascii=False)
                     yield f"data: {event_data}\n\n"
                     
-                    # Small delay to make streaming visible
-                    await asyncio.sleep(0.1)
+                    # No artificial delay - let natural streaming happen
                 
                 # Send final end event
                 yield f"data: {json.dumps({'type': 'end', 'content': 'Stream ended'})}\n\n"
@@ -189,22 +188,6 @@ async def chat_stream(request: ChatRequest):
     except Exception as e:
         logger.exception(f"Error in streaming endpoint: {e}")
         raise HTTPException(status_code=500, detail=f"Streaming error: {str(e)}")
-
-@app.get("/status")
-async def get_status():
-    """Get API and agent status"""
-    return {
-        "status": "running",
-        "version": "3.0.0",
-        "active_threads": len(unified_handler.active_threads),
-        "timestamp": datetime.now().isoformat(),
-        "features": [
-            "Unified RAG processing", 
-            "Server-Sent Events streaming", 
-            "Multi-language support",
-            "Complete response data"
-        ]
-    }
 
 
 
@@ -317,7 +300,7 @@ async def test_stream():
                 language="en"
             ):
                 yield f"data: {json.dumps(event)}\n\n"
-                await asyncio.sleep(0.2)
+                # No artificial delay for test streaming
         except Exception as e:
             error_event = {"type": "error", "content": f"Test stream error: {str(e)}"}
             yield f"data: {json.dumps(error_event)}\n\n"
